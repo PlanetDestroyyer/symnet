@@ -265,23 +265,23 @@ class GridWorld(gym.Env):
         # ---- Compute reward signals (based on phase) ----
         if self.phase == 1:
             # Single agent (Agent A must reach goal, B is ignored for task success)
-            task_reward = 10.0 if a_at_goal else 0.0
+            task_reward = 50.0 if a_at_goal else 0.0
             coord_bonus = 0.0
-            efficiency_bonus = 1.0 if a_at_goal and self._step_count <= self.max_steps * 0.5 else 0.0
+            efficiency_bonus = 5.0 if a_at_goal and self._step_count <= self.max_steps * 0.5 else 0.0
             terminated = bool(a_at_goal)
         elif self.phase == 2:
             # Independent (Each gets reward for reaching their own goal)
-            task_reward = (5.0 if a_at_goal else 0.0) + (5.0 if b_at_goal else 0.0)
+            task_reward = (25.0 if a_at_goal else 0.0) + (25.0 if b_at_goal else 0.0)
             coord_bonus = 0.0
-            efficiency_bonus = 1.0 if both_at_goal and self._step_count <= self.max_steps * 0.5 else 0.0
+            efficiency_bonus = 5.0 if both_at_goal and self._step_count <= self.max_steps * 0.5 else 0.0
             terminated = bool(both_at_goal)
         else:
             # Cooperative (Phase 3)
-            task_reward       = 10.0  if both_at_goal else 0.0
-            coord_bonus       = 3.0   if both_at_goal and not np.array_equal(self._goal_a, self._goal_b) else 0.0
+            task_reward       = 50.0  if both_at_goal else 0.0
+            coord_bonus       = 10.0  if both_at_goal and not np.array_equal(self._goal_a, self._goal_b) else 0.0
             efficiency_bonus  = 0.0
             if both_at_goal:
-                efficiency_bonus = 1.0 if self._step_count <= self.max_steps * 0.5 else 0.0
+                efficiency_bonus = 5.0 if self._step_count <= self.max_steps * 0.5 else 0.0
             terminated = bool(both_at_goal)
 
         collision_penalty = -0.5  if collision else 0.0

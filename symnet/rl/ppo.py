@@ -111,6 +111,7 @@ class PPOTrainer:
         self.episode_rewards: list[float] = []
         self.episode_collisions: list[int] = []
         self.episode_successes: list[int] = []
+        self.episode_dists: list[float] = []
 
         # Saved comm vectors + positions (for linear probe)
         self._comm_log: list[dict] = []
@@ -131,6 +132,7 @@ class PPOTrainer:
         ep_reward     = 0.0
         ep_collisions = 0
         ep_steps      = 0
+        ep_dist_sum   = 0.0
 
         for _ in range(N_STEPS):
             # Convert observations
@@ -166,6 +168,7 @@ class PPOTrainer:
             ep_reward     += reward
             ep_steps      += 1
             ep_collisions += int(info["collision"])
+            ep_dist_sum   += float(np.linalg.norm(info["pos_a"] - info["goal_a"]) + np.linalg.norm(info["pos_b"] - info["goal_b"])) / 2.0
 
             self.buffer.add(
                 obs_a       = obs_a,
@@ -177,7 +180,7 @@ class PPOTrainer:
                 log_prob_a  = float(lp_a.item()),
                 log_prob_b  = float(lp_b.item()),
                 value       = value,
-                reward      = reward,
+                reward      = reward / 10.0,
                 done        = done,
             )
 
@@ -197,17 +200,23 @@ class PPOTrainer:
             comm_b = new_comm_b
             obs_a  = obs_a_next
             obs_b  = obs_b_next
+            
+            if self.global_step > 0 and self.global_step % 1000 == 0:
+                print(f"DEBUG [{self.global_step}] PosA:{info['pos_a']} GoalA:{info['goal_a']} | PosB:{info['pos_b']} GoalB:{info['goal_b']} Phase:{self.env.phase}")
+                
             self.global_step += 1
 
             if done:
                 self.episodes_done += 1
                 self.episode_rewards.append(ep_reward)
                 self.episode_collisions.append(ep_collisions)
-                self.episode_successes.append(int(terminated))
+                self.episode_successes.append(int(info["both_at_goal"]))
+                self.episode_dists.append(ep_dist_sum / max(1, ep_steps))
 
                 ep_reward     = 0.0
                 ep_collisions = 0
                 ep_steps      = 0
+                ep_dist_sum   = 0.0
 
                 (obs_a, obs_b), info = self.env.reset()
                 comm_a = self.model.zero_comm(1, self.device)
@@ -227,6 +236,7 @@ class PPOTrainer:
         total_loss_val   = 0.0
         total_policy_val = 0.0
         total_entropy    = 0.0
+        total_comm_grad  = 0.0
         n_updates        = 0
 
         for _ in range(PPO_EPOCHS):
@@ -269,6 +279,10 @@ class PPOTrainer:
                 self.optimizer.zero_grad()
                 total_loss.backward()
                 nn.utils.clip_grad_norm_(self.model.parameters(), MAX_GRAD_NORM)
+                
+                comm_grad = self.model.comm_head.weight.grad
+                total_comm_grad += comm_grad.norm().item() if comm_grad is not None else 0.0
+                
                 self.optimizer.step()
                 self.scheduler.step()
 
@@ -279,9 +293,10 @@ class PPOTrainer:
 
         n = max(1, n_updates)
         return {
-            "loss":    total_loss_val   / n,
-            "policy":  total_policy_val / n,
-            "entropy": total_entropy    / n,
+            "loss":           total_loss_val   / n,
+            "policy":         total_policy_val / n,
+            "entropy":        total_entropy    / n,
+            "comm_grad_norm": total_comm_grad  / n,
         }
 
     # ──────────────────────────────────────────────────────
@@ -298,7 +313,8 @@ class PPOTrainer:
             writer.writerow([
                 'step', 'episode', 'reward', 'episode_length',
                 'task_success', 'collision_rate', 
-                'comm_l2_norm', 'actor_loss', 'critic_loss'
+                'comm_l2_norm', 'comm_grad_norm', 'mean_dist', 
+                'actor_loss', 'critic_loss'
             ])
 
     def _log(self, losses: dict[str, float]) -> None:
@@ -317,6 +333,10 @@ class PPOTrainer:
             float(np.mean(self.episode_successes[-recent:]))
             if self.episode_successes else 0.0
         )
+        mean_dist = (
+            float(np.mean(self.episode_dists[-recent:]))
+            if self.episode_dists else 0.0
+        )
 
         # Comm vector stats (from buffer)
         comm_a_norm = float(np.linalg.norm(self.buffer.comm_a, axis=1).mean())
@@ -332,8 +352,11 @@ class PPOTrainer:
             f"reward={avg_reward:>+7.2f} "
             f"success={success_rate:.2f} "
             f"collision={collision_rate:.3f} "
-            f"|comm|={comm_a_norm:.3f}/{comm_b_norm:.3f} "
-            f"loss={losses['loss']:.4f}"
+            f"dist={mean_dist:.2f} "
+            f"|comm|={comm_a_norm:.2f}/{comm_b_norm:.2f} "
+            f"∇comm={losses.get('comm_grad_norm', 0.0):.4f} "
+            f"loss={losses['loss']:.4f} "
+            f"val={losses['loss'] - losses['policy']:.4f}"
         )
 
         import csv
@@ -347,6 +370,8 @@ class PPOTrainer:
                 success_rate,
                 collision_rate,
                 comm_norm_avg,
+                losses.get("comm_grad_norm", 0.0),
+                mean_dist,
                 losses["policy"],
                 losses["loss"] - losses["policy"],  # approx critic + entropy
             ])
