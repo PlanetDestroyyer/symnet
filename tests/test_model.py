@@ -137,10 +137,12 @@ class TestGradientFlow:
         logits_b, comm_b_out, val_b = model(obs_b, comm_a)
 
         # Fake losses
-        loss_a = logits_a.mean() + val_a.mean() + comm_a_out.mean()
-        loss_b = logits_b.mean() + val_b.mean() + comm_b_out.mean()
-        total  = loss_a + loss_b
-        total.backward()
+        loss = logits_a.sum() + comm_a_out.sum() + val_a.sum() + \
+               model.comm_projection(comm_a_out).sum() + \
+               logits_b.sum() + comm_b_out.sum() + val_b.sum() + \
+               model.comm_projection(comm_b_out).sum()
+
+        loss.backward()
 
         # Every parameter should have a gradient
         for name, param in model.named_parameters():
@@ -149,6 +151,7 @@ class TestGradientFlow:
     def test_action_logits_are_differentiable(self, model):
         obs     = torch.randn(1, 75, requires_grad=False)
         comm_in = torch.randn(1, model.comm_dim)
-        logits, _, _ = model(obs, comm_in)
-        loss = logits.sum()
-        loss.backward()   # should not raise
+        logits, comm_out, _ = model(obs, comm_in)
+        loss = logits.sum() + model.comm_projection(comm_out).sum()
+        loss.backward()
+        assert model.action_head.weight.grad is not None

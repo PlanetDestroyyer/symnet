@@ -85,9 +85,10 @@ class SymNetModel(nn.Module):
         # ── Output heads ──────────────────────────────────────────────────
         self.action_head = nn.Linear(hidden_dim, n_actions)
         self.comm_head   = nn.Linear(hidden_dim, comm_dim)
+        self.value_head  = nn.Linear(hidden_dim, 1)
 
-        # ── Value head for PPO ─────────────────────────────────────────────
-        self.value_head = nn.Linear(hidden_dim, 1)
+        # Auxiliary comm prediction head (BUG 1)
+        self.comm_projection = nn.Linear(comm_dim, 75)
 
         self._init_weights()
 

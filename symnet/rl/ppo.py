@@ -237,6 +237,7 @@ class PPOTrainer:
         total_policy_val = 0.0
         total_entropy    = 0.0
         total_comm_grad  = 0.0
+        total_proj_grad  = 0.0
         n_updates        = 0
 
         for _ in range(PPO_EPOCHS):
@@ -250,7 +251,7 @@ class PPOTrainer:
                 ) = batch
 
                 # ── Agent A forward ──────────────────────────────────────
-                logits_a, _, val_a = self.model(obs_a, comm_b)
+                logits_a, new_comm_a, val_a = self.model(obs_a, comm_b)
                 dist_a     = torch.distributions.Categorical(logits=logits_a)
                 lp_a       = dist_a.log_prob(actions_a)
                 entropy_a  = dist_a.entropy().mean()
@@ -262,7 +263,7 @@ class PPOTrainer:
                 loss_a     = policy_a + VALUE_COEF * value_a - ENTROPY_COEF * entropy_a
 
                 # ── Agent B forward ──────────────────────────────────────
-                logits_b, _, val_b = self.model(obs_b, comm_a)
+                logits_b, new_comm_b, val_b = self.model(obs_b, comm_a)
                 dist_b     = torch.distributions.Categorical(logits=logits_b)
                 lp_b       = dist_b.log_prob(actions_b)
                 entropy_b  = dist_b.entropy().mean()
@@ -273,8 +274,16 @@ class PPOTrainer:
                 value_b    = F.mse_loss(val_b.squeeze(-1), returns)
                 loss_b     = policy_b + VALUE_COEF * value_b - ENTROPY_COEF * entropy_b
 
+                # BUG 1: Auxiliary comm loss
+                comm_pred_obs_b = self.model.comm_projection(new_comm_a)
+                comm_pred_obs_a = self.model.comm_projection(new_comm_b)
+                
+                aux_loss_a = F.mse_loss(comm_pred_obs_b, obs_b.detach())
+                aux_loss_b = F.mse_loss(comm_pred_obs_a, obs_a.detach())
+                aux_loss = aux_loss_a + aux_loss_b
+
                 # ── Accumulate BOTH gradients before optimizer step ──────
-                total_loss = loss_a + loss_b
+                total_loss = loss_a + loss_b + 0.1 * aux_loss
 
                 self.optimizer.zero_grad()
                 total_loss.backward()
@@ -282,6 +291,9 @@ class PPOTrainer:
                 
                 comm_grad = self.model.comm_head.weight.grad
                 total_comm_grad += comm_grad.norm().item() if comm_grad is not None else 0.0
+                
+                proj_grad = self.model.comm_projection.weight.grad
+                total_proj_grad += proj_grad.norm().item() if proj_grad is not None else 0.0
                 
                 self.optimizer.step()
                 self.scheduler.step()
@@ -297,6 +309,7 @@ class PPOTrainer:
             "policy":         total_policy_val / n,
             "entropy":        total_entropy    / n,
             "comm_grad_norm": total_comm_grad  / n,
+            "proj_grad_norm": total_proj_grad  / n,
         }
 
     # ──────────────────────────────────────────────────────
@@ -313,7 +326,7 @@ class PPOTrainer:
             writer.writerow([
                 'step', 'episode', 'reward', 'episode_length',
                 'task_success', 'collision_rate', 
-                'comm_l2_norm', 'comm_grad_norm', 'mean_dist', 
+                'comm_l2_norm', 'comm_grad_norm', 'proj_grad_norm', 'mean_dist', 
                 'actor_loss', 'critic_loss'
             ])
 
@@ -355,6 +368,7 @@ class PPOTrainer:
             f"dist={mean_dist:.2f} "
             f"|comm|={comm_a_norm:.2f}/{comm_b_norm:.2f} "
             f"∇comm={losses.get('comm_grad_norm', 0.0):.4f} "
+            f"∇proj={losses.get('proj_grad_norm', 0.0):.4f} "
             f"loss={losses['loss']:.4f} "
             f"val={losses['loss'] - losses['policy']:.4f}"
         )
@@ -371,6 +385,7 @@ class PPOTrainer:
                 collision_rate,
                 comm_norm_avg,
                 losses.get("comm_grad_norm", 0.0),
+                losses.get("proj_grad_norm", 0.0),
                 mean_dist,
                 losses["policy"],
                 losses["loss"] - losses["policy"],  # approx critic + entropy

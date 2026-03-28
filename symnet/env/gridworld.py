@@ -284,11 +284,16 @@ class GridWorld(gym.Env):
                 efficiency_bonus = 5.0 if self._step_count <= self.max_steps * 0.5 else 0.0
             terminated = bool(both_at_goal)
 
+        # Dense shaped reward (BUG 2)
+        dist_a = np.linalg.norm(self._pos_a - self._goal_a)
+        dist_b = np.linalg.norm(self._pos_b - self._goal_b)
+        dense_reward = -0.1 * (dist_a + dist_b)
+
         collision_penalty = -0.5  if collision else 0.0
         # comm_penalty applied per step in trainer (outside env)
         # timeout_penalty applied at termination in trainer
 
-        total_reward = task_reward + coord_bonus + efficiency_bonus + collision_penalty
+        total_reward = task_reward + coord_bonus + efficiency_bonus + collision_penalty + dense_reward
 
         truncated  = bool(self._step_count >= self.max_steps)
 
