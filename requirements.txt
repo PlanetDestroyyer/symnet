@@ -1,0 +1,6 @@
+torch>=2.1
+numpy>=1.24
+gymnasium>=0.29
+scikit-learn>=1.3
+pytest>=7.4
+einops>=0.7

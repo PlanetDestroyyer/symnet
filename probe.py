@@ -1,0 +1,191 @@
+"""
+probe.py — Linear Probe and Interventions for SymNet
+
+1. Probes comm vectors to predict: position, goal, direction.
+2. Runs intervention tests: normal vs zero vs gaussian comm_vectors.
+3. Saves report to ./probe_results/report.json
+"""
+
+import argparse
+import glob
+import json
+import os
+import pickle
+
+import numpy as np
+import torch
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import accuracy_score
+
+from symnet.env.gridworld import GridWorld
+from symnet.models.symnet_model import SymNetModel
+from symnet.utils import get_device
+
+def load_comm_vectors(path: str) -> list[dict]:
+    with open(path, "rb") as f:
+        return pickle.load(f)
+
+def compute_direction(p1: np.ndarray, p2: np.ndarray) -> int:
+    """Return 8-way compass direction from p1 to p2."""
+    dy = p2[0] - p1[0]
+    dx = p2[1] - p1[1]
+    angle = np.arctan2(dy, dx)
+    return int((angle / np.pi + 1.0) * 4) % 8
+
+def run_single_probe(X: np.ndarray, y: np.ndarray) -> dict:
+    if len(X) == 0:
+        return {"accuracy": 0.0, "chance": 0.0}
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    scaler = StandardScaler()
+    X_train = scaler.fit_transform(X_train)
+    X_test  = scaler.transform(X_test)
+
+    clf = LogisticRegression(max_iter=1000, solver="lbfgs", multi_class="multinomial")
+    clf.fit(X_train, y_train)
+    y_pred = clf.predict(X_test)
+
+    acc = accuracy_score(y_test, y_pred)
+    chance = 1.0 / max(1, len(np.unique(y)))
+    return {"accuracy": acc, "chance": chance}
+
+def run_probes(records: list[dict], grid_size: int = 8) -> dict:
+    # We will probe comm_b to predict B's properties (which A receives)
+    # 1. Position B
+    # 2. Goal B
+    # 3. Direction from A to Goal B
+    
+    X, y_pos, y_goal, y_dir = [], [], [], []
+    for rec in records:
+        comm_b = rec["comm_b"]
+        pos_a  = rec["pos_a"]
+        pos_b  = rec["pos_b"]
+        goal_b = rec["goal_b"]
+
+        X.append(comm_b)
+        y_pos.append(int(pos_b[0] * grid_size + pos_b[1]))
+        y_goal.append(int(goal_b[0] * grid_size + goal_b[1]))
+        y_dir.append(compute_direction(pos_a, goal_b))
+
+    X = np.array(X, dtype=np.float32)
+    
+    print("Running Position Probe...")
+    res_pos = run_single_probe(X, np.array(y_pos, dtype=np.int64))
+    print("Running Goal Probe...")
+    res_goal = run_single_probe(X, np.array(y_goal, dtype=np.int64))
+    print("Running Direction Probe...")
+    res_dir = run_single_probe(X, np.array(y_dir, dtype=np.int64))
+
+    return {
+        "position": res_pos,
+        "goal": res_goal,
+        "direction": res_dir,
+    }
+
+@torch.no_grad()
+def run_intervention_test(
+    model: SymNetModel,
+    env: GridWorld,
+    device: torch.device,
+    mode: str,
+    n_episodes: int = 100,
+) -> dict:
+    model.eval()
+    successes = 0
+    total_reward = 0.0
+
+    for _ in range(n_episodes):
+        (obs_a, obs_b), info = env.reset()
+        comm_a = model.zero_comm(1, device)
+        comm_b = model.zero_comm(1, device)
+        
+        ep_reward = 0.0
+        done = False
+        
+        while not done:
+            t_obs_a = torch.from_numpy(obs_a).float().unsqueeze(0).to(device)
+            t_obs_b = torch.from_numpy(obs_b).float().unsqueeze(0).to(device)
+
+            # Intervene
+            if mode == "zero":
+                used_comm_a = model.zero_comm(1, device)
+                used_comm_b = model.zero_comm(1, device)
+            elif mode == "gaussian":
+                used_comm_a = torch.randn_like(comm_a)
+                used_comm_b = torch.randn_like(comm_b)
+            else:
+                used_comm_a = comm_a
+                used_comm_b = comm_b
+
+            logits_a, new_comm_a, _ = model(t_obs_a, used_comm_b)
+            logits_b, new_comm_b, _ = model(t_obs_b, used_comm_a)
+
+            action_a = torch.argmax(logits_a, dim=-1).item()
+            action_b = torch.argmax(logits_b, dim=-1).item()
+
+            (obs_a, obs_b), reward, terminated, truncated, info = env.step(action_a, action_b)
+            done = terminated or truncated
+            ep_reward += reward
+            comm_a, comm_b = new_comm_a, new_comm_b
+
+        total_reward += ep_reward
+        if info.get("both_at_goal", False):
+            successes += 1
+
+    return {
+        "success_rate": successes / max(1, n_episodes),
+        "avg_reward": total_reward / max(1, n_episodes),
+    }
+
+def main() -> None:
+    p = argparse.ArgumentParser()
+    p.add_argument("--comm-dir", type=str, default="checkpoints")
+    p.add_argument("--model-path", type=str, default="checkpoints/model_final.pt")
+    args = p.parse_args()
+
+    # 1. Linear Probes
+    print("Loading comm vectors...")
+    records = []
+    pattern = os.path.join(args.comm_dir, "comm_vectors_*.pkl")
+    for fp in sorted(glob.glob(pattern)):
+        records.extend(load_comm_vectors(fp))
+    
+    probe_results = {}
+    if records:
+        print(f"Loaded {len(records)} records. Running probes...")
+        probe_results = run_probes(records)
+    else:
+        print("No records found to probe.")
+
+    # 2. Interventions
+    interv_results = {}
+    device = get_device()
+    if os.path.exists(args.model_path):
+        print(f"Loading model from {args.model_path} for interventions...")
+        model = SymNetModel().to(device)
+        model.load_state_dict(torch.load(args.model_path, map_location=device, weights_only=True))
+        env = GridWorld(grid_size=8, phase=3)
+        
+        for mode in ["normal", "zero", "gaussian"]:
+            print(f"Running intervention: {mode}")
+            res = run_intervention_test(model, env, device, mode, n_episodes=50)
+            interv_results[mode] = res
+    else:
+        print(f"Model not found at {args.model_path}; skipping interventions.")
+
+    # 3. Report
+    report = {
+        "probes": probe_results,
+        "interventions": interv_results,
+    }
+
+    os.makedirs("probe_results", exist_ok=True)
+    out_path = "probe_results/report.json"
+    with open(out_path, "w") as f:
+        json.dump(report, f, indent=4)
+    print(f"\nReport saved to {out_path}")
+
+
+if __name__ == "__main__":
+    main()
