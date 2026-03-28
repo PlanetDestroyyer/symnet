@@ -1,0 +1,57 @@
+import numpy as np
+
+class MineDojoWrapper:
+    """
+    Drop-in replacement for GridWorld.
+    Returns same interface: obs_A, obs_B, reward, done
+    """
+    def __init__(self, task="survival"):
+        try:
+            import minedojo
+        except ImportError:
+            raise ImportError("Please install minedojo: pip install minedojo")
+            
+        self.env = minedojo.make(
+            task_id="open-ended",
+            image_size=(64, 64)
+        )
+        self.obs_shape = (3, 64, 64)
+        self.max_steps = 1000
+
+    def reset(self):
+        obs = self.env.reset()
+        # Split single agent obs into A and B views
+        obs_A = self._process(obs)
+        obs_B = self._process(obs)  # TODO: second agent
+        
+        info = {
+            "pos_a": np.zeros(2), "pos_b": np.zeros(2),
+            "goal_a": np.zeros(2), "goal_b": np.zeros(2),
+            "collision": False, "both_at_goal": False, "step": 0
+        }
+        return (obs_A, obs_B), info
+
+    def step(self, action_A, action_B):
+        # Minedojo expects specific action format.
+        md_action = self.env.action_space.no_op()
+        if action_A == 0: md_action[0] = 1 # forward
+        elif action_A == 1: md_action[0] = 2 # back
+        elif action_A == 2: md_action[1] = 1 # left
+        elif action_A == 3: md_action[1] = 2 # right
+        
+        obs, reward, done, info = self.env.step(md_action)
+        
+        obs_A = self._process(obs)
+        obs_B = self._process(obs)
+        
+        new_info = {
+            "pos_a": np.zeros(2), "pos_b": np.zeros(2),
+            "goal_a": np.zeros(2), "goal_b": np.zeros(2),
+            "collision": False, "both_at_goal": done, "step": 0
+        }
+        
+        return (obs_A, obs_B), float(reward), done, False, new_info
+
+    def _process(self, obs):
+        # normalize pixels to [0,1]
+        return obs['rgb'].transpose(2,0,1) / 255.0

@@ -10,12 +10,13 @@ from __future__ import annotations
 # ---------------------------------------------------------------------------
 # Reward constants (spec §05)
 # ---------------------------------------------------------------------------
-TASK_REWARD       =  50.0   # both agents reach their assigned goals
-COORD_BONUS       =   3.0   # awarded alongside TASK_REWARD (goals distinct)
-EFFICIENCY_BONUS  =   1.0   # solved in < 50% of max_steps
-COMM_PENALTY      =  -0.01  # per communication step (applied by trainer)
-COLLISION_PENALTY =  -0.5   # agents occupy same cell
-TIMEOUT_PENALTY   =  -1.0   # episode terminated by truncation
+TASK_REWARD       =  10.0
+COORD_BONUS       =   5.0
+PROGRESS_REWARD   =   0.1  # moved closer to goal this step
+COMM_PENALTY      =  -0.001
+COLLISION_PENALTY =  -0.5
+TIMEOUT_PENALTY   =  -1.0
+STEP_PENALTY      =  -0.001
 
 
 def compute_step_reward(

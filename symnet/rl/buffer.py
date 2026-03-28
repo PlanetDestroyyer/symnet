@@ -140,6 +140,7 @@ class RolloutBuffer:
         adv_mean = self.advantages.mean()
         adv_std  = self.advantages.std() + 1e-8
         self.advantages = (self.advantages - adv_mean) / adv_std
+        self.advantages = np.clip(self.advantages, -5.0, 5.0)
 
     def get_batches(
         self,

@@ -93,13 +93,17 @@ class GridWorld(gym.Env):
     # ------------------------------------------------------------------
 
     def _sample_distinct_positions(self, n: int) -> list[np.ndarray]:
-        """Sample n distinct free (row, col) positions on the grid."""
+        """Sample n distinct free (row, col) positions on the grid. Agents (idx 0/1) spaced by 3."""
         positions: list[np.ndarray] = []
         occupied: set[tuple[int, int]] = set()
         while len(positions) < n:
             r = int(self._rng.integers(0, self.N))
             c = int(self._rng.integers(0, self.N))
             if (r, c) not in occupied:
+                if len(positions) == 1:
+                    dist = abs(r - positions[0][0]) + abs(c - positions[0][1])
+                    if dist < 3:
+                        continue
                 occupied.add((r, c))
                 positions.append(np.array([r, c], dtype=np.int32))
         return positions
@@ -184,6 +188,7 @@ class GridWorld(gym.Env):
 
         self._step_count = 0
         self._solved_step = None
+        self._visit_grid = np.zeros((self.N, self.N), dtype=np.float32)
 
         # Sample 2 agents + 2 goals + obstacles (all distinct)
         n_special = 4 + self.num_obstacles  # agents, goals, obstacles
@@ -232,7 +237,6 @@ class GridWorld(gym.Env):
         self._step_count += 1
 
         # ---- Move agents (ignore walls / boundaries) ----
-        # Temporarily clear agent tiles for collision logic
         self._grid[tuple(self._pos_a)] = EMPTY if not (
             np.array_equal(self._pos_a, self._goal_a) or
             np.array_equal(self._pos_a, self._goal_b)
@@ -241,6 +245,9 @@ class GridWorld(gym.Env):
             np.array_equal(self._pos_b, self._goal_a) or
             np.array_equal(self._pos_b, self._goal_b)
         ) else (GOAL_A if np.array_equal(self._pos_b, self._goal_a) else GOAL_B)
+
+        old_dist_a = np.linalg.norm(self._pos_a - self._goal_a)
+        old_dist_b = np.linalg.norm(self._pos_b - self._goal_b)
 
         new_pos_a = self._try_move(self._pos_a, action_a)
         new_pos_b = self._try_move(self._pos_b, action_b)
@@ -254,52 +261,61 @@ class GridWorld(gym.Env):
         self._pos_a = new_pos_a
         self._pos_b = new_pos_b
 
-        # Re-stamp grid
         self._grid = self._build_grid()
+
+        # Exploration trace
+        self._visit_grid[self._pos_a[0], self._pos_a[1]] += 1.0
+        self._visit_grid[self._pos_b[0], self._pos_b[1]] += 1.0
 
         # ---- Check goal condition ----
         a_at_goal = np.array_equal(self._pos_a, self._goal_a)
         b_at_goal = np.array_equal(self._pos_b, self._goal_b)
         both_at_goal = a_at_goal and b_at_goal
 
+        new_dist_a = np.linalg.norm(self._pos_a - self._goal_a)
+        new_dist_b = np.linalg.norm(self._pos_b - self._goal_b)
+        progress_a = 1.0 if new_dist_a < old_dist_a else 0.0
+        progress_b = 1.0 if new_dist_b < old_dist_b else 0.0
+
+        # Exploration bonus
+        exp_bonus_a = 0.05 / np.sqrt(self._visit_grid[self._pos_a[0], self._pos_a[1]])
+        exp_bonus_b = 0.05 / np.sqrt(self._visit_grid[self._pos_b[0], self._pos_b[1]])
+        exp_bonus = exp_bonus_a + exp_bonus_b
+
         # ---- Compute reward signals (based on phase) ----
         if self.phase == 1:
-            # Single agent (Agent A must reach goal, B is ignored for task success)
-            task_reward = 50.0 if a_at_goal else 0.0
+            task_reward = 10.0 if a_at_goal else 0.0
             coord_bonus = 0.0
-            efficiency_bonus = 5.0 if a_at_goal and self._step_count <= self.max_steps * 0.5 else 0.0
+            eff_bonus = 0.0
+            progress_reward = 0.1 * progress_a
             terminated = bool(a_at_goal)
         elif self.phase == 2:
-            # Independent (Each gets reward for reaching their own goal)
-            task_reward = (25.0 if a_at_goal else 0.0) + (25.0 if b_at_goal else 0.0)
+            task_reward = (5.0 if a_at_goal else 0.0) + (5.0 if b_at_goal else 0.0)
             coord_bonus = 0.0
-            efficiency_bonus = 5.0 if both_at_goal and self._step_count <= self.max_steps * 0.5 else 0.0
+            eff_bonus = 0.0
+            progress_reward = 0.1 * (progress_a + progress_b)
             terminated = bool(both_at_goal)
         else:
-            # Cooperative (Phase 3)
-            task_reward       = 50.0  if both_at_goal else 0.0
-            coord_bonus       = 10.0  if both_at_goal and not np.array_equal(self._goal_a, self._goal_b) else 0.0
-            efficiency_bonus  = 0.0
-            if both_at_goal:
-                efficiency_bonus = 5.0 if self._step_count <= self.max_steps * 0.5 else 0.0
+            task_reward       = 10.0  if both_at_goal else 0.0
+            coord_bonus       = 5.0  if both_at_goal and not np.array_equal(self._goal_a, self._goal_b) else 0.0
+            eff_bonus         = 0.0
+            progress_reward   = 0.1 * (progress_a + progress_b)
             terminated = bool(both_at_goal)
 
-        # Dense shaped reward (BUG 2)
-        dist_a = np.linalg.norm(self._pos_a - self._goal_a)
-        dist_b = np.linalg.norm(self._pos_b - self._goal_b)
-        dense_reward = -0.1 * (dist_a + dist_b)
-
         collision_penalty = -0.5  if collision else 0.0
-        # comm_penalty applied per step in trainer (outside env)
-        # timeout_penalty applied at termination in trainer
-
-        total_reward = task_reward + coord_bonus + efficiency_bonus + collision_penalty + dense_reward
+        step_penalty = -0.001
+        
+        total_reward = task_reward + coord_bonus + eff_bonus + collision_penalty + progress_reward + step_penalty + exp_bonus
 
         truncated  = bool(self._step_count >= self.max_steps)
 
         # ---- Observations ----
         obs_a = self._get_obs(self._pos_a, is_agent_a=True).flatten()
         obs_b = self._get_obs(self._pos_b, is_agent_a=False).flatten()
+
+        
+        visit_probs = self._visit_grid / max(1, self._visit_grid.sum())
+        visit_entropy = -np.sum(visit_probs[visit_probs > 0] * np.log(visit_probs[visit_probs > 0]))
 
         info = {
             "pos_a": self._pos_a.copy(),
@@ -311,10 +327,10 @@ class GridWorld(gym.Env):
             "b_at_goal": b_at_goal,
             "both_at_goal": both_at_goal,
             "step": self._step_count,
+            "visit_entropy": float(visit_entropy),
             # Individual reward components for logging
             "task_reward": task_reward,
             "coord_bonus": coord_bonus,
-            "efficiency_bonus": efficiency_bonus,
             "collision_penalty": collision_penalty,
         }
 

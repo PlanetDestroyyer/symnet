@@ -21,9 +21,10 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 
 from symnet.models.symnet_model import SymNetModel
-from symnet.env.gridworld import GridWorld
 from symnet.rl.buffer import RolloutBuffer
 from symnet.reward import COMM_PENALTY, TIMEOUT_PENALTY
+from symnet.rl.rms import RunningMeanStd
+from symnet.rl.rnd import RNDModule
 
 
 # ────────────────────────────────────────────────────────────
@@ -73,11 +74,12 @@ class PPOTrainer:
     def __init__(
         self,
         model: SymNetModel,
-        env: GridWorld,
+        env,
         device: torch.device,
         total_steps: int = 500_000,
         save_dir: str = "checkpoints",
         save_every: int = 10_000,
+        obs_shape: tuple = (75,)
     ) -> None:
         self.model       = model.to(device)
         self.env         = env
@@ -99,12 +101,20 @@ class PPOTrainer:
 
         self.buffer = RolloutBuffer(
             n_steps=N_STEPS,
-            obs_shape=(75,),
+            obs_shape=obs_shape,
             comm_dim=model.comm_dim,
             n_actions=model.n_actions,
             gamma=GAMMA,
             gae_lambda=GAE_LAMBDA,
         )
+
+        self.obs_rms = RunningMeanStd(shape=obs_shape)
+        self.reward_rms = RunningMeanStd(shape=())
+
+        import numpy as np
+        obs_dim = int(np.prod(obs_shape))
+        self.rnd = RNDModule(obs_dim=obs_dim).to(device)
+        self.rnd_optimizer = AdamW(self.rnd.predictor.parameters(), lr=1e-4)
 
         self.global_step          = 0
         self.episodes_done        = 0
@@ -112,6 +122,8 @@ class PPOTrainer:
         self.episode_collisions: list[int] = []
         self.episode_successes: list[int] = []
         self.episode_dists: list[float] = []
+        self.episode_rnd_bonuses: list[float] = []
+        self.episode_visit_entropies: list[float] = []
 
         # Saved comm vectors + positions (for linear probe)
         self._comm_log: list[dict] = []
@@ -133,11 +145,21 @@ class PPOTrainer:
         ep_collisions = 0
         ep_steps      = 0
         ep_dist_sum   = 0.0
+        ep_rnd_sum    = 0.0
 
         for _ in range(N_STEPS):
-            # Convert observations
-            t_obs_a = torch.from_numpy(obs_a).float().unsqueeze(0).to(self.device)
-            t_obs_b = torch.from_numpy(obs_b).float().unsqueeze(0).to(self.device)
+            # Convert and normalize observations
+            self.obs_rms.update(obs_a)
+            self.obs_rms.update(obs_b)
+            norm_obs_a = self.obs_rms.normalize(obs_a)
+            norm_obs_b = self.obs_rms.normalize(obs_b)
+
+            t_obs_a = torch.from_numpy(norm_obs_a).float().unsqueeze(0).to(self.device)
+            t_obs_b = torch.from_numpy(norm_obs_b).float().unsqueeze(0).to(self.device)
+
+            rnd_bonus_a = self.rnd.bonus(t_obs_a).item()
+            rnd_bonus_b = self.rnd.bonus(t_obs_b).item()
+            rnd_bonus = 0.01 * (rnd_bonus_a + rnd_bonus_b)
 
             # Forward pass — agent A receives comm from B and vice-versa
             logits_a, new_comm_a, val_a = self.model(t_obs_a, comm_b)
@@ -163,16 +185,22 @@ class PPOTrainer:
             if truncated and not terminated:
                 reward += TIMEOUT_PENALTY
 
+            reward += rnd_bonus
+            
+            self.reward_rms.update([reward])
+            norm_reward = self.reward_rms.normalize([reward])[0]
+
             done = terminated or truncated
 
             ep_reward     += reward
             ep_steps      += 1
             ep_collisions += int(info["collision"])
             ep_dist_sum   += float(np.linalg.norm(info["pos_a"] - info["goal_a"]) + np.linalg.norm(info["pos_b"] - info["goal_b"])) / 2.0
-
+            ep_rnd_sum    += rnd_bonus
+            
             self.buffer.add(
-                obs_a       = obs_a,
-                obs_b       = obs_b,
+                obs_a       = norm_obs_a,
+                obs_b       = norm_obs_b,
                 comm_a      = new_comm_a.squeeze(0).cpu().numpy(),
                 comm_b      = new_comm_b.squeeze(0).cpu().numpy(),
                 action_a    = int(action_a.item()),
@@ -180,7 +208,7 @@ class PPOTrainer:
                 log_prob_a  = float(lp_a.item()),
                 log_prob_b  = float(lp_b.item()),
                 value       = value,
-                reward      = reward / 10.0,
+                reward      = norm_reward,
                 done        = done,
             )
 
@@ -201,8 +229,9 @@ class PPOTrainer:
             obs_a  = obs_a_next
             obs_b  = obs_b_next
             
-            if self.global_step > 0 and self.global_step % 1000 == 0:
-                print(f"DEBUG [{self.global_step}] PosA:{info['pos_a']} GoalA:{info['goal_a']} | PosB:{info['pos_b']} GoalB:{info['goal_b']} Phase:{self.env.phase}")
+            if self.global_step % 1000 == 0:
+                phase = getattr(self.env, "phase", "N/A")
+                print(f"DEBUG [{self.global_step}] PosA:{info.get('pos_a')} GoalA:{info.get('goal_a')} | PosB:{info.get('pos_b')} GoalB:{info.get('goal_b')} Phase:{phase}")
                 
             self.global_step += 1
 
@@ -212,18 +241,22 @@ class PPOTrainer:
                 self.episode_collisions.append(ep_collisions)
                 self.episode_successes.append(int(info["both_at_goal"]))
                 self.episode_dists.append(ep_dist_sum / max(1, ep_steps))
+                self.episode_rnd_bonuses.append(ep_rnd_sum / max(1, ep_steps))
+                self.episode_visit_entropies.append(info.get("visit_entropy", 0.0))
 
                 ep_reward     = 0.0
                 ep_collisions = 0
                 ep_steps      = 0
                 ep_dist_sum   = 0.0
+                ep_rnd_sum    = 0.0
 
                 (obs_a, obs_b), info = self.env.reset()
                 comm_a = self.model.zero_comm(1, self.device)
                 comm_b = self.model.zero_comm(1, self.device)
 
         # Compute last value for bootstrap
-        t_obs_a = torch.from_numpy(obs_a).float().unsqueeze(0).to(self.device)
+        norm_obs_a = self.obs_rms.normalize(obs_a)
+        t_obs_a = torch.from_numpy(norm_obs_a).float().unsqueeze(0).to(self.device)
         _, _, last_val_a = self.model(t_obs_a, comm_b)
         self.buffer.compute_returns_and_advantages(last_val_a.item())
 
@@ -278,8 +311,8 @@ class PPOTrainer:
                 comm_pred_obs_b = self.model.comm_projection(new_comm_a)
                 comm_pred_obs_a = self.model.comm_projection(new_comm_b)
                 
-                aux_loss_a = F.mse_loss(comm_pred_obs_b, obs_b.detach())
-                aux_loss_b = F.mse_loss(comm_pred_obs_a, obs_a.detach())
+                aux_loss_a = F.mse_loss(comm_pred_obs_b, obs_b.detach().view(obs_b.size(0), -1))
+                aux_loss_b = F.mse_loss(comm_pred_obs_a, obs_a.detach().view(obs_a.size(0), -1))
                 aux_loss = aux_loss_a + aux_loss_b
 
                 # ── Accumulate BOTH gradients before optimizer step ──────
@@ -297,6 +330,18 @@ class PPOTrainer:
                 
                 self.optimizer.step()
                 self.scheduler.step()
+
+                # Train RND Predictor
+                pred_feat_a = self.rnd.predictor(obs_a)
+                pred_feat_b = self.rnd.predictor(obs_b)
+                with torch.no_grad():
+                    target_feat_a = self.rnd.target(obs_a)
+                    target_feat_b = self.rnd.target(obs_b)
+                loss_rnd = F.mse_loss(pred_feat_a, target_feat_a) + F.mse_loss(pred_feat_b, target_feat_b)
+                
+                self.rnd_optimizer.zero_grad()
+                loss_rnd.backward()
+                self.rnd_optimizer.step()
 
                 total_loss_val   += total_loss.item()
                 total_policy_val += (policy_a + policy_b).item()
@@ -327,7 +372,7 @@ class PPOTrainer:
                 'step', 'episode', 'reward', 'episode_length',
                 'task_success', 'collision_rate', 
                 'comm_l2_norm', 'comm_grad_norm', 'proj_grad_norm', 'mean_dist', 
-                'actor_loss', 'critic_loss'
+                'actor_loss', 'critic_loss', 'visit_entropy', 'rnd_bonus_mean', 'advantage_std', 'obs_mean'
             ])
 
     def _log(self, losses: dict[str, float]) -> None:
@@ -350,6 +395,17 @@ class PPOTrainer:
             float(np.mean(self.episode_dists[-recent:]))
             if self.episode_dists else 0.0
         )
+        visit_entropy = (
+            float(np.mean(self.episode_visit_entropies[-recent:]))
+            if self.episode_visit_entropies else 0.0
+        )
+        rnd_bonus_mean = (
+            float(np.mean(self.episode_rnd_bonuses[-recent:]))
+            if self.episode_rnd_bonuses else 0.0
+        )
+
+        advantage_std = float(self.buffer.advantages.std())
+        obs_mean = float(self.buffer.obs_a.mean())
 
         # Comm vector stats (from buffer)
         comm_a_norm = float(np.linalg.norm(self.buffer.comm_a, axis=1).mean())
@@ -389,6 +445,10 @@ class PPOTrainer:
                 mean_dist,
                 losses["policy"],
                 losses["loss"] - losses["policy"],  # approx critic + entropy
+                visit_entropy,
+                rnd_bonus_mean,
+                advantage_std,
+                obs_mean
             ])
 
     def _save_checkpoint(self) -> None:

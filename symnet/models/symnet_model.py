@@ -28,6 +28,29 @@ COMM_DIM      = 128
 HIDDEN_DIM    = 512
 N_ACTIONS     = 4       # up down left right
 
+class CNNEncoder(nn.Module):
+    def __init__(self, obs_shape=(3,64,64), comm_dim=128, d_model=512):
+        super().__init__()
+        self.cnn = nn.Sequential(
+            nn.Conv2d(3, 32, 8, stride=4), nn.ReLU(),
+            nn.Conv2d(32, 64, 4, stride=2), nn.ReLU(),
+            nn.Conv2d(64, 64, 3, stride=1), nn.ReLU(),
+            nn.Flatten()
+        )
+        dummy = torch.zeros(1, *obs_shape)
+        cnn_out = self.cnn(dummy).shape[1]
+        
+        self.proj = nn.Linear(cnn_out + comm_dim, d_model)
+        self.proj_flat = nn.Linear(75 + comm_dim, d_model)
+
+    def forward(self, obs, comm):
+        if obs.dim() == 2:
+            x = torch.cat([obs, comm], dim=-1)
+            return F.relu(self.proj_flat(x))
+        feat = self.cnn(obs)
+        x = torch.cat([feat, comm], dim=-1)
+        return F.relu(self.proj(x))
+
 
 class SymNetModel(nn.Module):
     """
@@ -46,9 +69,7 @@ class SymNetModel(nn.Module):
 
     def __init__(
         self,
-        obs_channels: int = OBS_CHANNELS,
-        obs_size: int = OBS_SIZE,
-        obs_emb_dim: int = OBS_EMB_DIM,
+        obs_dim: int = 75,
         comm_dim: int = COMM_DIM,
         hidden_dim: int = HIDDEN_DIM,
         n_actions: int = N_ACTIONS,
@@ -56,25 +77,13 @@ class SymNetModel(nn.Module):
     ) -> None:
         super().__init__()
 
+        self.obs_dim    = obs_dim
         self.comm_dim   = comm_dim
         self.hidden_dim = hidden_dim
         self.n_actions  = n_actions
 
-        # ── Observation encoder ────────────────────────────────────────────
-        # Input: (B, 3, 5, 5)
-        # Conv2d: 3→32 channels, kernel 3×3 → output (B, 32, 3, 3)
-        # Flatten → 288, Linear → obs_emb_dim
-        conv_out_size = 32 * (obs_size - 2) * (obs_size - 2)  # k=3, no padding
-        self.obs_encoder = nn.Sequential(
-            nn.Conv2d(obs_channels, 32, kernel_size=3, padding=0),
-            nn.ReLU(),
-            nn.Flatten(),
-            nn.Linear(conv_out_size, obs_emb_dim),
-            nn.ReLU(),
-        )
-
-        # ── Input projection: obs_emb + comm_in → hidden_dim ──────────────
-        self.input_proj = nn.Linear(obs_emb_dim + comm_dim, hidden_dim)
+        # ── Encoder (BUG 6: CNN) ────────────────────────────────────────────────
+        self.obs_encoder = CNNEncoder(obs_shape=(3, 64, 64), comm_dim=comm_dim, d_model=hidden_dim)
 
         # ── Mamba SSM backbone ─────────────────────────────────────────────
         self.mamba = MambaSSM(
@@ -88,9 +97,16 @@ class SymNetModel(nn.Module):
         self.value_head  = nn.Linear(hidden_dim, 1)
 
         # Auxiliary comm prediction head (BUG 1)
-        self.comm_projection = nn.Linear(comm_dim, 75)
+        self.comm_projection = nn.Linear(comm_dim, obs_dim)
+
+        self.recurrent_state_A = None
+        self.recurrent_state_B = None
 
         self._init_weights()
+
+    def reset_states(self):
+        self.recurrent_state_A = None
+        self.recurrent_state_B = None
 
     def _init_weights(self) -> None:
         """Xavier init for linear layers, he init for conv."""
@@ -123,18 +139,12 @@ class SymNetModel(nn.Module):
         comm_out      : (B, comm_dim)    — this agent's outgoing comm vector
         value         : (B, 1)          — state value estimate (for PPO)
         """
-        # Reshape to (B, C, H, W) for Conv2d
-        obs_spatial = obs.view(-1, 3, 5, 5)
+        x = self.obs_encoder(obs, comm_in)
         
-        # Encode observation
-        obs_emb = self.obs_encoder(obs_spatial)      # (B, obs_emb_dim)
-
-        # Concatenate with incoming comm
-        x = torch.cat([obs_emb, comm_in], dim=-1)   # (B, obs_emb_dim + comm_dim)
-        x = F.relu(self.input_proj(x))               # (B, hidden_dim)
-
-        # Mamba SSM — treat single step as sequence of length 1
-        h = self.mamba(x)                            # (B, hidden_dim)
+        # Mamba requires (B, L, D) = (Batch, 1, hidden_dim)
+        x_seq = x.unsqueeze(1)
+        h = self.mamba(x_seq)
+        h = h.squeeze(1)                  # (B, hidden_dim)
 
         # Output heads
         action_logits = self.action_head(h)          # (B, n_actions)
@@ -142,6 +152,16 @@ class SymNetModel(nn.Module):
         value         = self.value_head(h)           # (B, 1)
 
         return action_logits, comm_out, value
+
+    def step(self, obs: torch.Tensor, comm_in: torch.Tensor, agent: str = 'A') -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Recurrent inference mode for Minecraft deployment (single step).
+        """
+        x = self.obs_encoder(obs, comm_in)
+        x = x.unsqueeze(1)
+        x = self.mamba(x)
+        x = x.squeeze(1)
+        return self.action_head(x), self.comm_head(x)
 
     def zero_comm(self, batch_size: int = 1, device: torch.device | None = None) -> torch.Tensor:
         """Return a zeroed communication vector (for episode start)."""

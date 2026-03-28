@@ -3,7 +3,7 @@ name = "symnet"
 version = "0.1.0"
 description = "Symmetric Dual-Agent RL with Emergent Communication"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 dependencies = [
     "einops>=0.7",
     "gymnasium>=0.29",
