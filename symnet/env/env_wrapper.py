@@ -13,7 +13,8 @@ class MineDojoWrapper:
             
         self.env = minedojo.make(
             task_id="open-ended",
-            image_size=(64, 64)
+            image_size=(64, 64),
+            event_level_control=True
         )
         self.obs_shape = (3, 64, 64)
         self.max_steps = 1000
