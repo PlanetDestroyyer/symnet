@@ -89,6 +89,7 @@ def run_intervention_test(
     device: torch.device,
     mode: str,
     n_episodes: int = 100,
+    obs_rms: any = None,
 ) -> dict:
     model.eval()
     successes = 0
@@ -103,8 +104,16 @@ def run_intervention_test(
         done = False
         
         while not done:
-            t_obs_a = torch.from_numpy(obs_a).float().unsqueeze(0).to(device)
-            t_obs_b = torch.from_numpy(obs_b).float().unsqueeze(0).to(device)
+            # Normalize if obs_rms is provided
+            if obs_rms is not None:
+                norm_obs_a = obs_rms.normalize(obs_a)
+                norm_obs_b = obs_rms.normalize(obs_b)
+            else:
+                norm_obs_a = obs_a
+                norm_obs_b = obs_b
+                
+            t_obs_a = torch.from_numpy(norm_obs_a).float().unsqueeze(0).to(device)
+            t_obs_b = torch.from_numpy(norm_obs_b).float().unsqueeze(0).to(device)
 
             # Intervene
             if mode == "zero":
@@ -166,13 +175,33 @@ def run_probe(comm_dir="comm_logs", model_path="checkpoints/model_final.pt") -> 
     device = get_device()
     if os.path.exists(model_path):
         print(f"Loading model from {model_path} for interventions...")
+        ckpt = torch.load(model_path, map_location=device)
         model = SymNetModel().to(device)
-        model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
+        
+        from symnet.rl.rms import RunningMeanStd
+        obs_rms = RunningMeanStd(shape=(75,))
+        
+        if isinstance(ckpt, dict) and 'model_state_dict' in ckpt:
+            model.load_state_dict(ckpt['model_state_dict'])
+            obs_rms.mean = ckpt['obs_rms_mean']
+            obs_rms.var = ckpt['obs_rms_var']
+            obs_rms.count = ckpt['obs_rms_count']
+            print("Loaded observation normalization stats from checkpoint.")
+        else:
+            model.load_state_dict(ckpt)
+            print("WARNING: No normalization stats in checkpoint. Running 2000-step warmup to re-estimate mean/var...")
+            # Fallback: estimate RMS from the environment
+            env_warmup = GridWorld(grid_size=8, phase=3)
+            for _ in range(2000):
+                (o_a, o_b), _ = env_warmup.reset() if _ == 0 else env_warmup.step(0,0)[:2]
+                obs_rms.update(o_a)
+                obs_rms.update(o_b)
+        
         env = GridWorld(grid_size=8, phase=3)
         
         for mode in ["normal", "zero", "gaussian"]:
             print(f"Running intervention: {mode}")
-            res = run_intervention_test(model, env, device, mode, n_episodes=50)
+            res = run_intervention_test(model, env, device, mode, n_episodes=50, obs_rms=obs_rms)
             interv_results[mode] = res
     else:
         print(f"Model not found at {model_path}; skipping interventions.")

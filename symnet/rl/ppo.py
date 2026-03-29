@@ -474,7 +474,18 @@ class PPOTrainer:
         import os
         os.makedirs(self.save_dir, exist_ok=True)
         step = self.global_step
-        torch.save(self.model.state_dict(), f"{self.save_dir}/model_{step}.pt")
+        # Save model weights, obs_rms, and reward_rms
+        save_data = {
+            'model_state_dict': self.model.state_dict(),
+            'obs_rms_mean': self.obs_rms.mean,
+            'obs_rms_var': self.obs_rms.var,
+            'obs_rms_count': self.obs_rms.count,
+            'reward_rms_mean': self.reward_rms.mean,
+            'reward_rms_var': self.reward_rms.var,
+            'reward_rms_count': self.reward_rms.count,
+            'global_step': self.global_step
+        }
+        torch.save(save_data, f"{self.save_dir}/model_{step}.pt")
         # Also save final comm logs
         if self.comm_vectors_A:
             os.makedirs('./comm_logs', exist_ok=True)
