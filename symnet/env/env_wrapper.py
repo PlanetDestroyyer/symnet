@@ -1,4 +1,43 @@
 import numpy as np
+import os
+import sys
+
+def auto_patch_minedojo():
+    """
+    Automatically patches MineDojo's broken Gradle dependencies 
+    and sets up Java 8 environment for Kaggle/Colab.
+    """
+    try:
+        import minedojo
+    except ImportError:
+        return
+
+    # 1. Patch build.gradle for the MixinGradle error
+    minedojo_path = minedojo.__path__[0]
+    gradle_path = os.path.join(minedojo_path, "sim/Malmo/Minecraft/build.gradle")
+
+    if os.path.exists(gradle_path):
+        with open(gradle_path, "r") as f:
+            content = f.read()
+
+        repo_str = "maven { url 'https://repo.spongepowered.org/repository/maven-public/' }"
+        if repo_str not in content:
+            content = content.replace("repositories {", f"repositories {{\n        {repo_str}")
+
+        old_dep = "com.github.SpongePowered:MixinGradle:dcfaf61"
+        new_dep = "org.spongepowered:mixingradle:0.6-SNAPSHOT"
+        
+        if old_dep in content:
+            content = content.replace(old_dep, new_dep)
+            with open(gradle_path, "w") as f:
+                f.write(content)
+            print(f"[SymNet] Patched MineDojo build.gradle at {gradle_path}")
+
+    # 2. Set JAVA_HOME if Java 8 is found (standard Kaggle/Colab path)
+    java8_path = "/usr/lib/jvm/java-8-openjdk-amd64"
+    if os.path.exists(java8_path):
+        os.environ["JAVA_HOME"] = java8_path
+        print(f"[SymNet] Set JAVA_HOME to {java8_path}")
 
 class MineDojoWrapper:
     """
@@ -6,6 +45,7 @@ class MineDojoWrapper:
     Returns same interface: obs_A, obs_B, reward, done
     """
     def __init__(self, task="survival"):
+        auto_patch_minedojo()
         try:
             import minedojo
         except ImportError:
