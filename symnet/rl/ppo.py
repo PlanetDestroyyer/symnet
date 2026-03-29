@@ -477,6 +477,7 @@ class PPOTrainer:
         torch.save(self.model.state_dict(), f"{self.save_dir}/model_{step}.pt")
         # Also save final comm logs
         if self.comm_vectors_A:
+            os.makedirs('./comm_logs', exist_ok=True)
             torch.save({
                 'comm_A': self.comm_vectors_A,
                 'comm_B': self.comm_vectors_B,
