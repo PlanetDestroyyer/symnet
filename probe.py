@@ -47,7 +47,7 @@ def run_single_probe(X: np.ndarray, y: np.ndarray) -> dict:
 
     acc = accuracy_score(y_test, y_pred)
     chance = 1.0 / max(1, len(np.unique(y)))
-    return {"accuracy": acc, "chance": chance}
+    return {"accuracy": float(acc), "chance": float(chance)}
 
 def run_probes(records: list[dict], grid_size: int = 8) -> dict:
     # We will probe comm_b to predict B's properties (which A receives)
@@ -133,8 +133,8 @@ def run_intervention_test(
             successes += 1
 
     return {
-        "success_rate": successes / max(1, n_episodes),
-        "avg_reward": total_reward / max(1, n_episodes),
+        "success_rate": float(successes / max(1, n_episodes)),
+        "avg_reward": float(total_reward / max(1, n_episodes)),
     }
 
 def run_probe(comm_dir="comm_logs", model_path="checkpoints/model_final.pt") -> None:
@@ -175,7 +175,7 @@ def run_probe(comm_dir="comm_logs", model_path="checkpoints/model_final.pt") -> 
             res = run_intervention_test(model, env, device, mode, n_episodes=50)
             interv_results[mode] = res
     else:
-        print(f"Model not found at {args.model_path}; skipping interventions.")
+        print(f"Model not found at {model_path}; skipping interventions.")
 
     # 3. Report
     report = {
