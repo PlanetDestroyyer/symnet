@@ -129,8 +129,10 @@ def run_intervention_test(
             logits_a, new_comm_a, _ = model(t_obs_a, used_comm_b)
             logits_b, new_comm_b, _ = model(t_obs_b, used_comm_a)
 
-            action_a = torch.argmax(logits_a, dim=-1).item()
-            action_b = torch.argmax(logits_b, dim=-1).item()
+            dist_a = torch.distributions.Categorical(logits=logits_a)
+            dist_b = torch.distributions.Categorical(logits=logits_b)
+            action_a = dist_a.sample().item()
+            action_b = dist_b.sample().item()
 
             (obs_a, obs_b), reward, terminated, truncated, info = env.step(action_a, action_b)
             done = terminated or truncated
@@ -188,12 +190,14 @@ def run_probe(comm_dir="comm_logs", model_path="checkpoints/model_final.pt") -> 
             obs_rms.count = ckpt['obs_rms_count']
             print("Loaded observation normalization stats from checkpoint.")
         else:
-            model.load_state_dict(ckpt)
-            print("WARNING: No normalization stats in checkpoint. Running 2000-step warmup to re-estimate mean/var...")
+            print("WARNING: No normalization stats in checkpoint. Running 5000-step warmup to re-estimate mean/var...")
             # Fallback: estimate RMS from the environment
             env_warmup = GridWorld(grid_size=8, phase=3)
-            for _ in range(2000):
-                (o_a, o_b), _ = env_warmup.reset() if _ == 0 else env_warmup.step(0,0)[:2]
+            for _ in range(5000):
+                if _ % 200 == 0:
+                    (o_a, o_b), _ = env_warmup.reset()
+                else:
+                    (o_a, o_b), _, _, _, _ = env_warmup.step(np.random.randint(4), np.random.randint(4))
                 obs_rms.update(o_a)
                 obs_rms.update(o_b)
         
