@@ -11,10 +11,12 @@ class MineDojoWrapper:
         except ImportError:
             raise ImportError("Please install minedojo: pip install minedojo")
             
-        self.env = minedojo.make(
-            task_id="open-ended",
+        # Use simulation directly to avoid 'make()' wrapper assertions
+        from minedojo.sim import MineDojoSim
+        self.env = MineDojoSim(
             image_size=(64, 64),
-            event_level_control=True
+            event_level_control=True,
+            generate_world_type="default"
         )
         self.obs_shape = (3, 64, 64)
         self.max_steps = 1000
