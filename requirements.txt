@@ -11,3 +11,5 @@ hydra-core
 jsonlines
 praw
 minedojo
+pyvirtualdisplay
+xvfbwrapper

@@ -4,9 +4,19 @@ import sys
 
 def auto_patch_minedojo():
     """
-    Automatically patches MineDojo's broken Gradle dependencies 
-    and sets up Java 8 environment for Kaggle/Colab.
+    Automatically patches MineDojo's broken Gradle dependencies,
+    sets up Java 8 environment, and starts a virtual display for Kaggle/Colab.
     """
+    # 0. Start Virtual Display (required for Minecraft)
+    try:
+        from pyvirtualdisplay import Display
+        if not any(isinstance(v, Display) for v in globals().values()):
+            display = Display(visible=0, size=(640, 480))
+            display.start()
+            print("[SymNet] Started virtual display for MineDojo")
+    except Exception as e:
+        print(f"[SymNet] Could not start virtual display: {e}")
+
     try:
         import minedojo
     except ImportError:
