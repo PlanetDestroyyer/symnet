@@ -183,29 +183,55 @@ def run_probe(comm_dir="comm_logs", model_path="checkpoints/model_final.pt") -> 
         from symnet.rl.rms import RunningMeanStd
         obs_rms = RunningMeanStd(shape=(75,))
         
-        if isinstance(ckpt, dict) and 'model_state_dict' in ckpt:
+        if isinstance(ckpt, dict) and 'obs_rms_mean' in ckpt:
             model.load_state_dict(ckpt['model_state_dict'])
             obs_rms.mean = ckpt['obs_rms_mean']
             obs_rms.var = ckpt['obs_rms_var']
             obs_rms.count = ckpt['obs_rms_count']
             print("Loaded observation normalization stats from checkpoint.")
         else:
-            print("WARNING: No normalization stats in checkpoint. Running 5000-step warmup to re-estimate mean/var...")
-            # Fallback: estimate RMS from the environment
+            if isinstance(ckpt, dict) and 'model_state_dict' in ckpt:
+                model.load_state_dict(ckpt['model_state_dict'])
+            else:
+                model.load_state_dict(ckpt)
+            print("WARNING: No normalization stats in checkpoint. Running 5000-step warmup with TRAINED policy...")
+            # Fallback: estimate RMS from the environment using the policy itself!
             env_warmup = GridWorld(grid_size=8, phase=3)
+            model.eval()
+            (o_a, o_b), _ = env_warmup.reset()
+            c_a = model.zero_comm(1, device)
+            c_b = model.zero_comm(1, device)
             for _ in range(5000):
-                if _ % 200 == 0:
-                    (o_a, o_b), _ = env_warmup.reset()
-                else:
-                    (o_a, o_b), _, _, _, _ = env_warmup.step(np.random.randint(4), np.random.randint(4))
                 obs_rms.update(o_a)
                 obs_rms.update(o_b)
+                # Use current RMS to move
+                no_a = obs_rms.normalize(o_a)
+                no_b = obs_rms.normalize(o_b)
+                t_o_a = torch.from_numpy(no_a).float().unsqueeze(0).to(device)
+                t_o_b = torch.from_numpy(no_b).float().unsqueeze(0).to(device)
+                
+                with torch.no_grad():
+                    l_a, nc_a, _ = model(t_o_a, c_b)
+                    l_b, nc_b, _ = model(t_o_b, c_a)
+                
+                # Sample
+                a_a = torch.distributions.Categorical(logits=l_a).sample().item()
+                a_b = torch.distributions.Categorical(logits=l_b).sample().item()
+                
+                (o_a_next, o_b_next), _, term, trunc, _ = env_warmup.step(a_a, a_b)
+                if term or trunc:
+                    (o_a, o_b), _ = env_warmup.reset()
+                    c_a = model.zero_comm(1, device)
+                    c_b = model.zero_comm(1, device)
+                else:
+                    o_a, o_b = o_a_next, o_b_next
+                    c_a, c_b = nc_a, nc_b
         
         env = GridWorld(grid_size=8, phase=3)
         
         for mode in ["normal", "zero", "gaussian"]:
             print(f"Running intervention: {mode}")
-            res = run_intervention_test(model, env, device, mode, n_episodes=50, obs_rms=obs_rms)
+            res = run_intervention_test(model, env, device, mode, n_episodes=100, obs_rms=obs_rms)
             interv_results[mode] = res
     else:
         print(f"Model not found at {model_path}; skipping interventions.")
