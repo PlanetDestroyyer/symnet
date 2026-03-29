@@ -125,8 +125,12 @@ class PPOTrainer:
         self.episode_rnd_bonuses: list[float] = []
         self.episode_visit_entropies: list[float] = []
 
-        # Saved comm vectors + positions (for linear probe)
-        self._comm_log: list[dict] = []
+        self.comm_vectors_A = []
+        self.comm_vectors_B = []
+        self.positions_A = []
+        self.positions_B = []
+        self.goals_A = []
+        self.goals_B = []
 
     # ──────────────────────────────────────────────────────
     # Collect
@@ -212,17 +216,32 @@ class PPOTrainer:
                 done        = done,
             )
 
-            # Log comm vectors periodically
-            if self.global_step % self.save_every == 0:
-                self._comm_log.append({
-                    "step":    self.global_step,
-                    "comm_a":  new_comm_a.squeeze(0).cpu().numpy().copy(),
-                    "comm_b":  new_comm_b.squeeze(0).cpu().numpy().copy(),
-                    "pos_a":   info["pos_a"].copy(),
-                    "pos_b":   info["pos_b"].copy(),
-                    "goal_a":  info["goal_a"].copy(),
-                    "goal_b":  info["goal_b"].copy(),
-                })
+            self.comm_vectors_A.append(new_comm_a.squeeze(0).cpu().clone())
+            self.comm_vectors_B.append(new_comm_b.squeeze(0).cpu().clone())
+            self.positions_A.append(info["pos_a"].copy())
+            self.positions_B.append(info["pos_b"].copy())
+            self.goals_A.append(info["goal_a"].copy())
+            self.goals_B.append(info["goal_b"].copy())
+            
+            if self.global_step > 0 and self.global_step % 10000 == 0:
+                import os
+                os.makedirs('./comm_logs', exist_ok=True)
+                torch.save({
+                    'comm_A': self.comm_vectors_A,
+                    'comm_B': self.comm_vectors_B,
+                    'pos_A': self.positions_A,
+                    'pos_B': self.positions_B,
+                    'goal_A': self.goals_A,
+                    'goal_B': self.goals_B,
+                    'step': self.global_step
+                }, f'./comm_logs/comm_{self.global_step}.pt')
+                
+                self.comm_vectors_A.clear()
+                self.comm_vectors_B.clear()
+                self.positions_A.clear()
+                self.positions_B.clear()
+                self.goals_A.clear()
+                self.goals_B.clear()
 
             comm_a = new_comm_a
             comm_b = new_comm_b
@@ -452,14 +471,27 @@ class PPOTrainer:
             ])
 
     def _save_checkpoint(self) -> None:
-        """Save model weights and comm vectors."""
-        import os, pickle
+        import os
         os.makedirs(self.save_dir, exist_ok=True)
         step = self.global_step
         torch.save(self.model.state_dict(), f"{self.save_dir}/model_{step}.pt")
-        with open(f"{self.save_dir}/comm_vectors_{step}.pkl", "wb") as f:
-            pickle.dump(self._comm_log, f)
-        self._comm_log = []   # clear after saving
+        # Also save final comm logs
+        if self.comm_vectors_A:
+            torch.save({
+                'comm_A': self.comm_vectors_A,
+                'comm_B': self.comm_vectors_B,
+                'pos_A': self.positions_A,
+                'pos_B': self.positions_B,
+                'goal_A': self.goals_A,
+                'goal_B': self.goals_B,
+                'step': self.global_step
+            }, f'./comm_logs/comm_{self.global_step}.pt')
+            self.comm_vectors_A.clear()
+            self.comm_vectors_B.clear()
+            self.positions_A.clear()
+            self.positions_B.clear()
+            self.goals_A.clear()
+            self.goals_B.clear()
 
     # ──────────────────────────────────────────────────────
     # Main training loop
@@ -480,8 +512,8 @@ class PPOTrainer:
             if updates_done % max(1, log_every // N_STEPS) == 0:
                 self._log(losses)
 
-            # Save comm vectors every save_every steps
-            if self._comm_log:
+            if updates_done % max(1, 10000 // N_STEPS) == 0:
                 self._save_checkpoint()
 
+        self._save_checkpoint()
         print(f"\nTraining complete. {self.global_step} steps, {self.episodes_done} episodes.")

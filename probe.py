@@ -23,9 +23,8 @@ from symnet.env.gridworld import GridWorld
 from symnet.models.symnet_model import SymNetModel
 from symnet.utils import get_device
 
-def load_comm_vectors(path: str) -> list[dict]:
-    with open(path, "rb") as f:
-        return pickle.load(f)
+def load_comm_vectors_pt(path: str) -> dict:
+    return torch.load(path, map_location="cpu", weights_only=False)
 
 def compute_direction(p1: np.ndarray, p2: np.ndarray) -> int:
     """Return 8-way compass direction from p1 to p2."""
@@ -138,18 +137,22 @@ def run_intervention_test(
         "avg_reward": total_reward / max(1, n_episodes),
     }
 
-def main() -> None:
-    p = argparse.ArgumentParser()
-    p.add_argument("--comm-dir", type=str, default="checkpoints")
-    p.add_argument("--model-path", type=str, default="checkpoints/model_final.pt")
-    args = p.parse_args()
-
+def run_probe(comm_dir="comm_logs", model_path="checkpoints/model_final.pt") -> None:
     # 1. Linear Probes
     print("Loading comm vectors...")
     records = []
-    pattern = os.path.join(args.comm_dir, "comm_vectors_*.pkl")
+    pattern = os.path.join(comm_dir, "comm_*.pt")
     for fp in sorted(glob.glob(pattern)):
-        records.extend(load_comm_vectors(fp))
+        ckpt = load_comm_vectors_pt(fp)
+        for i in range(len(ckpt['comm_B'])):
+            records.append({
+                "comm_a": ckpt['comm_A'][i].numpy(),
+                "comm_b": ckpt['comm_B'][i].numpy(),
+                "pos_a": ckpt['pos_A'][i],
+                "pos_b": ckpt['pos_B'][i],
+                "goal_a": ckpt['goal_A'][i],
+                "goal_b": ckpt['goal_B'][i],
+            })
     
     probe_results = {}
     if records:
@@ -161,10 +164,10 @@ def main() -> None:
     # 2. Interventions
     interv_results = {}
     device = get_device()
-    if os.path.exists(args.model_path):
-        print(f"Loading model from {args.model_path} for interventions...")
+    if os.path.exists(model_path):
+        print(f"Loading model from {model_path} for interventions...")
         model = SymNetModel().to(device)
-        model.load_state_dict(torch.load(args.model_path, map_location=device, weights_only=True))
+        model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
         env = GridWorld(grid_size=8, phase=3)
         
         for mode in ["normal", "zero", "gaussian"]:
@@ -188,4 +191,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+    c_dir = sys.argv[1] if len(sys.argv) > 1 else 'comm_logs'
+    m_path = sys.argv[2] if len(sys.argv) > 2 else 'checkpoints/model_final.pt'
+    run_probe(c_dir, m_path)
